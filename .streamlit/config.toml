@@ -1,0 +1,27 @@
+# Streamlit Configuration for Name Card Extractor
+
+[server]
+# Server settings
+port = 8501
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+# Browser settings
+gatherUsageStats = false
+
+[theme]
+# Theme settings
+primaryColor = "#3B82F6"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F8FAFC"
+textColor = "#1F2937"
+font = "sans serif"
+
+[logger]
+# Logging settings
+level = "info"
+
+[client]
+# Client settings
+showErrorDetails = true
