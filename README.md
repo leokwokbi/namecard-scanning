@@ -35,9 +35,24 @@ pip install -r requirements.txt
 
 ## Run
 
+For local access on the same machine:
+
 ```bash
 python -m streamlit run app.py
 ```
+
+For access from other devices on the same network, bind Streamlit to all interfaces:
+
+```bash
+python -m streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+```
+
+Then open `http://your-ip-address:8501` from another device on the same network.
+
+Notes:
+- Windows Firewall must allow inbound access to port `8501`
+- For internet/public access, you also need port forwarding, reverse proxying, or deployment on a public server
+- If exposing the app outside your machine, protect it because it uses credentials from [.env](.env)
 
 ## How to Use
 
@@ -83,6 +98,7 @@ AI_PROVIDER=openai
 OPENAI_API_KEY=your_api_key
 OPENAI_MODEL=gpt-4o-mini
 OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_REQUEST_TIMEOUT_SECONDS=120
 ```
 
 ### Azure OpenAI
@@ -110,9 +126,10 @@ AI_PROVIDER=openai_compatible
 OPENAI_COMPATIBLE_BASE_URL=http://localhost:11434/v1
 OPENAI_COMPATIBLE_API_KEY=
 OPENAI_COMPATIBLE_MODEL=llava
+OPENAI_COMPATIBLE_TIMEOUT_SECONDS=120
 ```
 
-This mode works for on-prem or private endpoints that expose an OpenAI-compatible chat completions API, such as Ollama gateways or vLLM services.
+This mode works for on-prem or private endpoints that expose an OpenAI-compatible chat completions API, such as Ollama gateways or vLLM services. Lower the timeout if you want faster failure for slow or unavailable local endpoints, or increase it for heavier vision models.
 
 ## Cumulative Storage
 

@@ -52,6 +52,17 @@ class BaseProvider:
         raise NotImplementedError
 
 
+def get_request_timeout(env_name: str, default_timeout: int) -> int:
+    raw_value = os.getenv(env_name, str(default_timeout)).strip()
+    try:
+        timeout = int(raw_value)
+        if timeout <= 0:
+            raise ValueError
+        return timeout
+    except ValueError:
+        return default_timeout
+
+
 class WatsonxProvider(BaseProvider):
     def __init__(self):
         self.api_key = os.getenv("WATSONX_API_KEY", "")
@@ -70,7 +81,7 @@ class WatsonxProvider(BaseProvider):
         data = f"grant_type=urn:ibm:params:oauth:grant-type:apikey&apikey={self.api_key}"
 
         try:
-            response = requests.post(token_url, headers=headers, data=data, timeout=30)
+            response = requests.post(token_url, headers=headers, data=data, timeout=120)
             response.raise_for_status()
             token = response.json().get("access_token", "")
             if not token:
@@ -115,7 +126,7 @@ class WatsonxProvider(BaseProvider):
         }
 
         try:
-            response = requests.post(self.api_url, headers=headers, json=body, timeout=90)
+            response = requests.post(self.api_url, headers=headers, json=body, timeout=120)
             response.raise_for_status()
             return response.json()["choices"][0]["message"]["content"]
         except requests.exceptions.HTTPError as e:
@@ -130,10 +141,20 @@ class WatsonxProvider(BaseProvider):
 
 
 class OpenAICompatibleProvider(BaseProvider):
-    def __init__(self, base_url_env: str, api_key_env: str, model_env: str, provider_name: str, default_base_url: str = ""):
+    def __init__(
+        self,
+        base_url_env: str,
+        api_key_env: str,
+        model_env: str,
+        provider_name: str,
+        default_base_url: str = "",
+        timeout_env: str = "OPENAI_REQUEST_TIMEOUT_SECONDS",
+        default_timeout: int = 120,
+    ):
         self.provider_name = provider_name
         self.base_url = os.getenv(base_url_env, default_base_url).rstrip("/")
         self.api_key = os.getenv(api_key_env, "")
+        self.request_timeout = get_request_timeout(timeout_env, default_timeout)
         model_id = os.getenv(model_env, "")
         super().__init__(model_id=model_id)
 
@@ -162,7 +183,12 @@ class OpenAICompatibleProvider(BaseProvider):
         }
 
         try:
-            response = requests.post(f"{self.base_url}/chat/completions", headers=headers, json=body, timeout=90)
+            response = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=body,
+                timeout=self.request_timeout,
+            )
             response.raise_for_status()
             return response.json()["choices"][0]["message"]["content"]
         except requests.exceptions.HTTPError as e:
@@ -170,6 +196,11 @@ class OpenAICompatibleProvider(BaseProvider):
             if response is not None:
                 raise Exception(f"{self.provider_name} API error: {response.status_code} - {response.text}")
             raise Exception(f"{self.provider_name} API error: {str(e)}")
+        except requests.exceptions.Timeout:
+            raise Exception(
+                f"{self.provider_name} request timed out after {self.request_timeout} seconds. "
+                "Reduce image size, use a faster endpoint, or increase the configured timeout."
+            )
         except requests.exceptions.RequestException as e:
             raise Exception(f"Network error during {self.provider_name} request: {str(e)}")
 
@@ -208,7 +239,7 @@ class AzureOpenAIProvider(BaseProvider):
         }
 
         try:
-            response = requests.post(url, headers=headers, json=body, timeout=90)
+            response = requests.post(url, headers=headers, json=body, timeout=120)
             response.raise_for_status()
             return response.json()["choices"][0]["message"]["content"]
         except requests.exceptions.HTTPError as e:
@@ -255,7 +286,7 @@ class GeminiProvider(BaseProvider):
         }
 
         try:
-            response = requests.post(url, headers=headers, json=body, timeout=90)
+            response = requests.post(url, headers=headers, json=body, timeout=120)
             response.raise_for_status()
             payload = response.json()
             return payload["candidates"][0]["content"]["parts"][0]["text"]
@@ -271,7 +302,7 @@ class GeminiProvider(BaseProvider):
 
 
 class NameCardExtractor:
-    def __init__(self, image_input_path: str, timeout_seconds: int = 15):
+    def __init__(self, image_input_path: str, timeout_seconds: int = 120):
         load_dotenv()
         self.image_input_path = image_input_path
         self.timeout_seconds = timeout_seconds
@@ -289,6 +320,7 @@ class NameCardExtractor:
                 model_env="OPENAI_MODEL",
                 provider_name="OpenAI",
                 default_base_url="https://api.openai.com/v1",
+                timeout_env="OPENAI_REQUEST_TIMEOUT_SECONDS",
             )
         if self.provider_name == "azure_openai":
             return AzureOpenAIProvider()
@@ -300,6 +332,8 @@ class NameCardExtractor:
                 api_key_env="OPENAI_COMPATIBLE_API_KEY",
                 model_env="OPENAI_COMPATIBLE_MODEL",
                 provider_name="OpenAI-compatible provider",
+                timeout_env="OPENAI_COMPATIBLE_TIMEOUT_SECONDS",
+                default_timeout=120,
             )
         raise Exception(
             "Unsupported AI_PROVIDER. Use watsonx, openai, azure_openai, gemini, or openai_compatible."
@@ -308,27 +342,16 @@ class NameCardExtractor:
     @staticmethod
     def _construct_prompt() -> str:
         return (
-            "You are a meticulous and trustworthy AI specializing in extracting business card information from images. "
-            "Your priority is accuracy and factual correctness. Never assume, estimate, or round off. "
-            "Extract only explicitly stated values exactly as written.\n\n"
-            "You are given an image of a name card. Extract the following items:\n"
-            "- Company Name\n"
-            "- Name\n"
-            "- Title\n"
-            "- Telephone\n"
-            "- Direct\n"
-            "- Mobile\n"
-            "- Fax\n"
-            "- Email\n"
-            "- Address\n"
-            "- Company Website\n\n"
-            "Rules:\n"
-            "1. Extract the exact value as written on the card. Do not infer or guess missing information.\n"
-            "2. If an item is missing, leave it as an empty string.\n"
-            "3. Return only valid raw JSON. Do not use markdown fences.\n"
-            "4. If the company name is not explicitly shown but can be safely derived from the email domain, use it.\n"
-            "5. Preserve phone numbers as written unless minor whitespace normalization is needed.\n\n"
-            "Return exactly this JSON structure:\n"
+            "You are a meticulous AI specializing in OCR and structured data extraction. "
+            "Extract business card information into valid raw JSON.\n\n"
+            "Strictly follow these rules:\n"
+            "1. QUALITY CHECK: If the image is too blurry, dark, or distorted to read accurately, "
+            "leave all fields empty and set 'Confidence_Note' to 'IMAGE_UNREADABLE'.\n"
+            "2. Accuracy: Extract values exactly as written. No rounding or estimation.\n"
+            "3. Missing Data: If a field is not present on the card, return an empty string (\"\").\n"
+            "4. Company Logic: If Company Name is missing from the layout, derive it from the email domain.\n"
+            "5. Formatting: Output ONLY the raw JSON object. No markdown fences or intro text.\n\n"
+            "Return exactly this structure:\n"
             "{\n"
             '  "Company_Name": "",\n'
             '  "Name": "",\n'
@@ -339,9 +362,74 @@ class NameCardExtractor:
             '  "Fax": "",\n'
             '  "Email": "",\n'
             '  "Address": "",\n'
-            '  "Company_Website": ""\n'
+            '  "Company_Website": "",\n'
+            '  "Confidence_Note": ""\n'
             "}"
         )
+
+    # @staticmethod
+    # def _construct_prompt() -> str:
+    #     return (
+    #         "You are a meticulous AI specializing in OCR and structured data extraction. "
+    #         "Extract business card information into valid raw JSON. "
+    #         "Strictly follow these rules:\n\n"
+    #         "1. Accuracy: Extract values exactly as written. No rounding or estimation.\n"
+    #         "2. Missing Data: If a field is not present, return an empty string (\"\").\n"
+    #         "3. Company Logic: If Company Name is missing from the layout, derive it from the email domain.\n"
+    #         "4. Formatting: Output ONLY the raw JSON object. No markdown fences, no introductory text, no explanations.\n"
+    #         "5. Telephone Mapping: Map 'T' to Telephone, 'D' to Direct, and 'M' to Mobile.\n\n"
+    #         "Return exactly this structure:\n"
+    #         "{\n"
+    #         '  "Company_Name": "",\n'
+    #         '  "Name": "",\n'
+    #         '  "Title": "",\n'
+    #         '  "Telephone": "",\n'
+    #         '  "Direct": "",\n'
+    #         '  "Mobile": "",\n'
+    #         '  "Fax": "",\n'
+    #         '  "Email": "",\n'
+    #         '  "Address": "",\n'
+    #         '  "Company_Website": ""\n'
+    #         "}"
+    #     )
+
+    # @staticmethod
+    # def _construct_prompt() -> str:
+    #     return (
+    #         "You are a meticulous and trustworthy AI specializing in extracting business card information from images. "
+    #         "Your priority is accuracy and factual correctness. Never assume, estimate, or round off. "
+    #         "Extract only explicitly stated values exactly as written.\n\n"
+    #         "You are given an image of a name card. Extract the following items:\n"
+    #         "- Company Name\n"
+    #         "- Name\n"
+    #         "- Title\n"
+    #         "- Telephone\n"
+    #         "- Direct\n"
+    #         "- Mobile\n"
+    #         "- Fax\n"
+    #         "- Email\n"
+    #         "- Address\n"
+    #         "- Company Website\n\n"
+    #         "Rules:\n"
+    #         "1. Extract the exact value as written on the card. Do not infer or guess missing information.\n"
+    #         "2. If an item is missing, leave it as an empty string.\n"
+    #         "3. Return only valid raw JSON. Do not use markdown fences.\n"
+    #         "4. If the company name is not explicitly shown but can be safely derived from the email domain, use it.\n"
+    #         "5. Preserve phone numbers as written unless minor whitespace normalization is needed.\n\n"
+    #         "Return exactly this JSON structure:\n"
+    #         "{\n"
+    #         '  "Company_Name": "",\n'
+    #         '  "Name": "",\n'
+    #         '  "Title": "",\n'
+    #         '  "Telephone": "",\n'
+    #         '  "Direct": "",\n'
+    #         '  "Mobile": "",\n'
+    #         '  "Fax": "",\n'
+    #         '  "Email": "",\n'
+    #         '  "Address": "",\n'
+    #         '  "Company_Website": ""\n'
+    #         "}"
+    #     )
 
     def encode_image(self) -> str:
         with open(self.image_input_path, "rb") as image_file:

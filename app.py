@@ -96,6 +96,7 @@ def initialize_session_state():
         'show_samples': False,
         'active_tab': 0,
         'last_saved_count': 0,
+        'pending_csv_save': False,
     }
 
     for key, default_value in defaults.items():
@@ -286,7 +287,7 @@ def process_batch_images(files, progress_container):
 
 
 def finalize_processed_results(results: List[Dict[str, Any]], replace_existing: bool = True):
-    """Store results in session state and append successful ones to the master CSV file."""
+    """Store results in session state and mark them for CSV save after confirmation."""
     if replace_existing:
         st.session_state.extracted_data = results
     else:
@@ -295,11 +296,7 @@ def finalize_processed_results(results: List[Dict[str, Any]], replace_existing: 
     st.session_state.processing_complete = bool(st.session_state.extracted_data)
     st.session_state.confirmed = False
     st.session_state.top_confirmed = False
-
-    successful_results = get_successful_results(results)
-    if successful_results:
-        saved_count = save_results_to_master_csv(successful_results)
-        st.success(f"📁 {saved_count} record(s) appended to [namecard_results.csv](namecard_results.csv).")
+    st.session_state.pending_csv_save = bool(get_successful_results(st.session_state.extracted_data))
 
 def display_processing_results(results):
     """Display processing completion message and animation"""
@@ -352,6 +349,38 @@ def display_image_with_info(uploaded_file):
         st.markdown(f"**Size:** {file_size:,} bytes")
         st.markdown(f"**Dimensions:** {image.width} × {image.height} pixels")
         st.markdown(f"**Format:** {image.format}")
+
+
+def display_batch_image_gallery(uploaded_files):
+    """Display all uploaded images in a responsive multi-column gallery."""
+    if not uploaded_files:
+        return
+
+    st.markdown(f"### 🖼️ Uploaded Images ({len(uploaded_files)})")
+    columns_per_row = 3
+
+    for start_index in range(0, len(uploaded_files), columns_per_row):
+        row_files = uploaded_files[start_index:start_index + columns_per_row]
+        columns = st.columns(columns_per_row)
+
+        for column, uploaded_file in zip(columns, row_files):
+            if hasattr(uploaded_file, 'seek'):
+                uploaded_file.seek(0)
+
+            image = Image.open(uploaded_file)
+            filename = getattr(uploaded_file, 'name', f'Image {start_index + 1}')
+            file_size = getattr(
+                uploaded_file,
+                'size',
+                len(uploaded_file.getvalue()) if hasattr(uploaded_file, 'getvalue') else 0,
+            )
+
+            with column:
+                st.image(image, caption=f"📄 {filename}", use_container_width=True)
+                st.caption(
+                    f"{file_size:,} bytes • {image.width} × {image.height} px • "
+                    f"{(image.format or 'Unknown').upper()}"
+                )
 
 def get_input_method_selection(key_prefix=""):
     """Get user's input method selection (upload vs camera)"""
@@ -627,10 +656,7 @@ def render_control_buttons():
     with col3:
         if not confirmed:
             if st.button("✅Confirm", use_container_width=True):
-                st.session_state.confirmed = True
-                st.session_state.top_confirmed = True
-                st.session_state.active_tab = 2  # Go to Export tab
-                #st.success("You have confirmed all results. You can now export your data in the Export tab.")
+                confirm_and_save_results()
                 st.rerun()
                 
                 
@@ -640,6 +666,26 @@ def render_control_buttons():
     with col4:
         pass  # Right spacing
             
+def confirm_and_save_results():
+    """Confirm results and append successful records to the master CSV once."""
+    st.session_state.confirmed = True
+    st.session_state.top_confirmed = True
+    st.session_state.active_tab = 2  # Go to Export tab
+
+    if st.session_state.get('pending_csv_save', False):
+        successful_results = get_successful_results(st.session_state.extracted_data)
+        if successful_results:
+            saved_count = save_results_to_master_csv(successful_results)
+            st.session_state.pending_csv_save = False
+            st.success(
+                f"✅ All results confirmed! 📁 {saved_count} record(s) appended to "
+                f"[namecard_results.csv](namecard_results.csv)."
+            )
+            return
+
+    st.success("✅ All results confirmed! You can now export your data.")
+
+
 def render_top_confirm_button():
     """Render additional confirm button at the top of results"""
     confirmed = st.session_state.get('top_confirmed', False)
@@ -650,10 +696,7 @@ def render_top_confirm_button():
     with col2:
         if not confirmed:
             if st.button("✅ Confirm All Results", type="primary", use_container_width=True, key="top_confirm"):
-                st.session_state.confirmed = True
-                st.session_state.top_confirmed = True
-                st.session_state.active_tab = 2  # Go to Export tab
-                st.success("✅ All results confirmed! You can now export your data.")
+                confirm_and_save_results()
                 st.rerun()
         else:
             st.success("✅ All results have been confirmed!")
@@ -666,6 +709,7 @@ def reset_session_data():
     st.session_state.processing_complete = False
     st.session_state.confirmed = False
     st.session_state.add_new_mode = False
+    st.session_state.pending_csv_save = False
 
 def render_add_new_namecard_section():
     """Render the add new namecard section"""
@@ -739,11 +783,8 @@ def render_batch_upload_section():
     uploaded_files = get_file_upload("batch", multiple=True)
     
     if uploaded_files:
-        # st.markdown(f"### 📁 Selected Files ({len(uploaded_files)})")
-        
-        # for idx, file in enumerate(uploaded_files, 1):
-        #     st.markdown(f"{idx}. **{file.name}** ({file.size:,} bytes)")
-        
+        display_batch_image_gallery(uploaded_files)
+
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
             if st.button("🔍 Extract All Information", type="primary", use_container_width=True):
