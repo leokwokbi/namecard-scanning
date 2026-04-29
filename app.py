@@ -28,11 +28,10 @@ from datetime import datetime
 from PIL import Image
 import io
 import base64
-import streamlit.components.v1 as components
 from typing import List, Dict, Any
 
-# Import your existing name card extractor
-from updated_backend import NameCardExtractor, NameCardOutput
+# Import extraction service
+from namecard_service import NameCardExtractor, append_results_to_csv
 
 # Page configuration
 st.set_page_config(
@@ -91,18 +90,35 @@ def initialize_session_state():
         'processing_complete': False,
         'current_image_index': 0,
         'confirmed': False,
-        'top_confirmed': False,  # For top confirm button
+        'top_confirmed': False,
         'add_new_mode': False,
         'camera_batch': [],
         'show_samples': False,
-        'active_tab': 0,  # 0: Extract, 1: Results, 2: Export
-        'credentials_provided': False,  # Track if credentials have been provided
-        'show_credentials_modal': False,  # Control modal display
+        'active_tab': 0,
+        'last_saved_count': 0,
     }
-    
+
     for key, default_value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = default_value
+
+
+def get_successful_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    successful_results = []
+    for result in results:
+        if result.get('status') != 'success' or 'data' not in result:
+            continue
+        data = result['data']
+        non_empty_fields = [v for v in data.values() if v and str(v).strip()]
+        if non_empty_fields:
+            successful_results.append(result)
+    return successful_results
+
+
+def save_results_to_master_csv(results: List[Dict[str, Any]]) -> int:
+    saved_count = append_results_to_csv(results)
+    st.session_state.last_saved_count = saved_count
+    return saved_count
 
 def validate_image(uploaded_file) -> bool:
     """Validate uploaded image file"""
@@ -127,136 +143,48 @@ def validate_image(uploaded_file) -> bool:
         st.error(f"Invalid image file: {str(e)}")
         return False
 
-def show_credentials_modal():
-    """Display a modal dialog for WatsonX credentials input"""
-    # Use Streamlit's dialog decorator
-    @st.dialog("🛡️ WatsonX Credentials Required")
-    def credentials_dialog():
-        st.markdown("""
-        Please provide your WatsonX credentials to use the name card extraction service.
-        """)
-        
-        # Get current values from session state to pre-populate the form
-        current_api_key = st.session_state.get('watsonx_api_key', '')
-        current_project_id = st.session_state.get('watsonx_project_id', '')
-        current_url = st.session_state.get('watsonx_url', 'https://us-south.ml.cloud.ibm.com')
-        
-        with st.form("credentials_form"):
-            api_key = st.text_input(
-                "WATSONX_API_KEY", 
-                value=current_api_key,  # Pre-populate with current value
-                type="password",
-                help="Your WatsonX API key"
-            )
-            
-            project_id = st.text_input(
-                "WATSONX_PROJECT_ID",
-                value=current_project_id,  # Pre-populate with current value
-                help="Your WatsonX project ID"
-            )
-            
-            url = st.text_input(
-                "WATSONX_URL",
-                value=current_url,  # Pre-populate with current value
-                help="WatsonX service URL"
-            )
-            
-            col_submit, col_cancel = st.columns(2)
-            
-            with col_submit:
-                submitted = st.form_submit_button("✅ Save & Continue", type="primary", use_container_width=True)
-            
-            with col_cancel:
-                cancelled = st.form_submit_button("❌ Cancel", use_container_width=True)
-            
-            if submitted:
-                if api_key and project_id:
-                    # Store credentials in session state
-                    st.session_state.watsonx_api_key = api_key
-                    st.session_state.watsonx_project_id = project_id
-                    st.session_state.watsonx_url = url
-                    st.session_state.credentials_provided = True
-                    st.session_state.show_credentials_modal = False
-                    st.success("✅ Credentials saved successfully!")
-                    st.rerun()
-                else:
-                    st.error("⚠️ Please provide both API Key and Project ID")
-            
-            elif cancelled:
-                st.session_state.show_credentials_modal = False
-                st.rerun()
-    
-    # Call the dialog function
-    credentials_dialog()
+def get_active_provider_name() -> str:
+    provider = os.getenv("AI_PROVIDER", "watsonx").strip().lower()
+    provider_labels = {
+        "watsonx": "IBM Watsonx",
+        "openai": "OpenAI",
+        "azure_openai": "Azure OpenAI",
+        "gemini": "Google Gemini",
+        "openai_compatible": "OpenAI-Compatible / On-Prem",
+    }
+    return provider_labels.get(provider, provider)
 
-def check_credentials():
-    """Check if credentials are provided and show modal if not"""
-    # Check if credentials exist in session state
-    api_key = st.session_state.get('watsonx_api_key', '')
-    project_id = st.session_state.get('watsonx_project_id', '')
-    
-    if not api_key or not project_id:
-        st.session_state.credentials_provided = False
-        st.session_state.show_credentials_modal = True
-        return False
-    else:
-        st.session_state.credentials_provided = True
-        st.session_state.show_credentials_modal = False
-        return True
 
 def process_single_image(uploaded_file, progress_bar=None) -> Dict[str, Any]:
     """Process a single name card image with failed image storage capability"""
+    tmp_file_path = ""
+    image_data = b""
+    file_extension = 'jpg'
+
     try:
         if hasattr(uploaded_file, 'seek'):
             uploaded_file.seek(0)
-        
-        # Get filename early to avoid variable scope issues
+
         filename = getattr(uploaded_file, 'name', 'camera_capture.jpg')
-        
-        # Store image data for potential retrieval on failure
         image_data = uploaded_file.getvalue()
-        image_size = len(image_data)
-        
-        # Get WatsonX credentials from session state
-        watsonx_api_key = st.session_state.get('watsonx_api_key', '')
-        watsonx_project_id = st.session_state.get('watsonx_project_id', '')
-        watsonx_url = st.session_state.get('watsonx_url', 'https://us-south.ml.cloud.ibm.com')
-        
-        # Validate that credentials are provided
-        if not watsonx_api_key or not watsonx_project_id:
-            return {
-                'filename': filename,
-                'status': 'error',
-                'error': 'Please provide WatsonX API Key and Project ID in the sidebar before processing images.',
-                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'image_data': image_data,  # Store failed image for retry
-                'image_format': filename.split('.')[-1] if '.' in filename else 'jpg'
-            }
-        
-        # Get file extension
-        file_extension = 'jpg'
+
         if hasattr(uploaded_file, 'name') and '.' in uploaded_file.name:
             file_extension = uploaded_file.name.split('.')[-1]
-        
-        # Save temporarily
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as tmp_file:
             tmp_file.write(image_data)
             tmp_file_path = tmp_file.name
         
         # Progress updates
+        provider_name = get_active_provider_name()
+
         if progress_bar:
-            progress_bar.progress(25, "Initializing extractor...")
-        
-        # Initialize extractor with user-provided credentials
-        extractor = NameCardExtractor(
-            image_input_path=tmp_file_path,
-            watsonx_api_key=watsonx_api_key,
-            watsonx_project_id=watsonx_project_id,
-            watsonx_url=watsonx_url
-        )
-        
+            progress_bar.progress(25, f"Initializing {provider_name} extractor...")
+
+        extractor = NameCardExtractor(image_input_path=tmp_file_path)
+
         if progress_bar:
-            progress_bar.progress(50, "Extracting information...")
+            progress_bar.progress(50, f"Extracting information with {provider_name}...")
         
         result = extractor.run()
         
@@ -271,11 +199,8 @@ def process_single_image(uploaded_file, progress_bar=None) -> Dict[str, Any]:
             os.unlink(tmp_file_path)
             error_message = parsed_result['error']
             
-            # Check for credential-related errors and provide clearer messages
-            if any(phrase in error_message.lower() for phrase in ['invalid watsonx api key', 'unauthorized', 'authentication failed', 'invalid api key']):
-                error_message = "Invalid API Key, Project ID or Watsonx URL. Please check your credentials."
-            elif 'invalid request to watsonx' in error_message.lower() or 'project id' in error_message.lower():
-                error_message = "Invalid API Key, Project ID or Watsonx URL. Please check your credentials."
+            if "missing" in error_message.lower() and ".env" in error_message.lower():
+                error_message = f"{provider_name} configuration is missing in [.env](.env)."
             
             return {
                 'filename': filename,
@@ -316,50 +241,65 @@ def process_single_image(uploaded_file, progress_bar=None) -> Dict[str, Any]:
         }
         
     except Exception as e:
-        if 'tmp_file_path' in locals():
+        if tmp_file_path:
             try:
                 os.unlink(tmp_file_path)
-            except:
+            except OSError:
                 pass
-        
+
         filename = getattr(uploaded_file, 'name', 'camera_capture.jpg')
         error_message = str(e)
-        
-        # Check for credential-related errors and provide clearer messages
-        if any(phrase in error_message.lower() for phrase in ['invalid watsonx api key', 'unauthorized', 'authentication failed', 'invalid api key']):
-            error_message = "Invalid API Key, Project ID or Watsonx URL. Please check your credentials."
-        elif 'invalid request to watsonx' in error_message.lower() or 'project id' in error_message.lower():
-            error_message = "Invalid API Key, Project ID or Watsonx URL. Please check your credentials."
-        
+
+        provider_name = get_active_provider_name()
+        if "missing" in error_message.lower() and ".env" in error_message.lower():
+            error_message = f"{provider_name} configuration is missing in [.env](.env)."
+
         return {
             'filename': filename,
             'status': 'error',
             'error': error_message,
             'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'image_data': image_data if 'image_data' in locals() else None,  # Store failed image for retry
-            'image_format': file_extension if 'file_extension' in locals() else 'jpg'
+            'image_data': image_data,
+            'image_format': file_extension
         }
 
 def process_batch_images(files, progress_container):
     """Process multiple images in batch"""
     valid_files = [f for f in files if validate_image(f)]
-    
+
     if not valid_files:
         st.error("No valid files to process.")
         return []
-    
+
     progress_bar = progress_container.progress(0, "Starting batch processing...")
     results = []
-    
+
     for idx, file in enumerate(valid_files):
         progress = (idx + 1) / len(valid_files)
         progress_bar.progress(progress, f"Processing {getattr(file, 'name', f'File {idx+1}')} ({idx + 1}/{len(valid_files)})")
-        
+
         result = process_single_image(file)
         results.append(result)
-    
+
     progress_bar.empty()
     return results
+
+
+def finalize_processed_results(results: List[Dict[str, Any]], replace_existing: bool = True):
+    """Store results in session state and append successful ones to the master CSV file."""
+    if replace_existing:
+        st.session_state.extracted_data = results
+    else:
+        st.session_state.extracted_data.extend(results)
+
+    st.session_state.processing_complete = bool(st.session_state.extracted_data)
+    st.session_state.confirmed = False
+    st.session_state.top_confirmed = False
+
+    successful_results = get_successful_results(results)
+    if successful_results:
+        saved_count = save_results_to_master_csv(successful_results)
+        st.success(f"📁 {saved_count} record(s) appended to [namecard_results.csv](namecard_results.csv).")
 
 def display_processing_results(results):
     """Display processing completion message and animation"""
@@ -376,7 +316,7 @@ def display_processing_results(results):
         if first_error and 'error' in first_error:
             error_msg = first_error['error']
             if "400 Client Error" in error_msg or "Bad Request" in error_msg:
-                st.error("🔑 **Authentication Error**: Please check your WatsonX credentials in the sidebar.")
+                st.error("🔑 **Configuration Error**: Please check the active provider settings in `.env`.")
             elif "timeout" in error_msg.lower():
                 st.error("⏱️ **Timeout Error**: Processing took too long. Please try again.")
             else:
@@ -764,34 +704,22 @@ def render_add_new_interface():
             
             with process_col1:
                 if st.button("🔍 Process This Card", type="primary", use_container_width=True):
-                    # Check if credentials are provided before processing
-                    api_key = st.session_state.get('watsonx_api_key', '')
-                    project_id = st.session_state.get('watsonx_project_id', '')
-                    
-                    if not api_key or not project_id:
-                        # Show credentials modal
-                        st.session_state.show_credentials_modal = True
-                        st.error("⚠️ Please provide WatsonX credentials to proceed with extraction.")
+                    progress_bar = st.progress(0, "Processing new name card...")
+
+                    with st.spinner("Extracting information from new card..."):
+                        new_result = process_single_image(current_image, progress_bar)
+                        finalize_processed_results([new_result], replace_existing=False)
+
+                    time.sleep(0.5)
+                    progress_bar.empty()
+
+                    if new_result['status'] == 'success':
+                        st.success("✅ New name card processed successfully!")
+                        st.balloons()
+                        st.session_state.add_new_mode = False
                         st.rerun()
                     else:
-                        # Proceed with processing
-                        progress_bar = st.progress(0, "Processing new name card...")
-                        
-                        with st.spinner("Extracting information from new card..."):
-                            new_result = process_single_image(current_image, progress_bar)
-                            st.session_state.extracted_data.append(new_result)
-                        
-                        time.sleep(0.5)
-                        progress_bar.empty()
-                        
-                        if new_result['status'] == 'success':
-                            st.success("✅ New name card processed successfully!")
-                            st.balloons()
-                            st.session_state.confirmed = False
-                            st.session_state.add_new_mode = False
-                            st.rerun()
-                        else:
-                            st.error(f"❌ Processing failed: {new_result.get('error', 'Unknown error')}")
+                        st.error(f"❌ Processing failed: {new_result.get('error', 'Unknown error')}")
             
             with process_col2:
                 if st.button("❌ Cancel", type="secondary", use_container_width=True):
@@ -819,24 +747,11 @@ def render_batch_upload_section():
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
             if st.button("🔍 Extract All Information", type="primary", use_container_width=True):
-                # Check if credentials are provided before processing
-                api_key = st.session_state.get('watsonx_api_key', '')
-                project_id = st.session_state.get('watsonx_project_id', '')
-                
-                if not api_key or not project_id:
-                    # Show credentials modal
-                    st.session_state.show_credentials_modal = True
-                    st.error("⚠️ Please provide WatsonX credentials to proceed with extraction.")
-                    st.rerun()
-                else:
-                    # Proceed with processing
-                    results = process_batch_images(uploaded_files, st)
-                    
-                    if results:
-                        st.session_state.extracted_data = results
-                        st.session_state.processing_complete = True
-                        st.session_state.confirmed = False
-                        display_processing_results(results)
+                results = process_batch_images(uploaded_files, st)
+
+                if results:
+                    finalize_processed_results(results, replace_existing=True)
+                    display_processing_results(results)
 
 def render_camera_batch_section():
     """Render camera batch processing section"""
@@ -886,41 +801,22 @@ def render_camera_batch_controls():
             st.rerun()
         
         if st.button("🔍 Process Batch", type="primary"):
-            # Check if credentials are provided before processing
-            api_key = st.session_state.get('watsonx_api_key', '')
-            project_id = st.session_state.get('watsonx_project_id', '')
-            
-            if not api_key or not project_id:
-                # Show credentials modal
-                st.session_state.show_credentials_modal = True
-                st.error("⚠️ Please provide WatsonX credentials to proceed with extraction.")
-                st.rerun()
-            else:
-                # Proceed with processing
-                camera_files = [create_camera_file_object(io.BytesIO(img['data']), img['name'].split('_')[-1].split('.')[0]) 
-                               for img in st.session_state.camera_batch]
-                
-                results = process_batch_images(camera_files, st)
-                
-                if results:
-                    st.session_state.extracted_data = results
-                    st.session_state.processing_complete = True
-                    st.session_state.camera_batch = []
-                    st.session_state.confirmed = False
-                    display_processing_results(results)
+            camera_files = [create_camera_file_object(io.BytesIO(img['data']), img['name'].split('_')[-1].split('.')[0])
+                           for img in st.session_state.camera_batch]
+
+            results = process_batch_images(camera_files, st)
+
+            if results:
+                finalize_processed_results(results, replace_existing=True)
+                st.session_state.camera_batch = []
+                display_processing_results(results)
     else:
         st.info("No images in batch yet. Take a photo and add it to start building your batch.")
 
-def export_to_excel(results: List[Dict[str, Any]]) -> bytes:
+def export_to_excel(results: List[Dict[str, Any]]) -> bytes | None:
     """Export results to Excel format - only include successful extractions with data"""
-    successful_results = []
-    for r in results:
-        if r['status'] == 'success' and 'data' in r:
-            data = r['data']
-            non_empty_fields = [v for v in data.values() if v and str(v).strip()]
-            if non_empty_fields:
-                successful_results.append(r)
-    
+    successful_results = get_successful_results(results)
+
     if not successful_results:
         return None
     
@@ -942,11 +838,16 @@ def export_to_excel(results: List[Dict[str, Any]]) -> bytes:
     extra_columns = [col for col in df.columns if col not in columns]
     df = df[available_columns + extra_columns]
     
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, sheet_name='Name Card Data', index=False)
-    
-    return output.getvalue()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_excel:
+        temp_excel_path = tmp_excel.name
+
+    try:
+        df.to_excel(temp_excel_path, sheet_name='Name Card Data', index=False, engine='openpyxl')
+        with open(temp_excel_path, "rb") as excel_file:
+            return excel_file.read()
+    finally:
+        if os.path.exists(temp_excel_path):
+            os.unlink(temp_excel_path)
 
 def export_to_json(results: List[Dict[str, Any]]) -> str:
     """Export results to JSON format - excluding binary image data"""
@@ -976,13 +877,16 @@ def render_sidebar():
         # st.markdown("### 🛠️ Settings")
         
         st.markdown("### ℹ️ Information")
-        st.markdown("""
-      
-        
+        st.markdown(f"""
+        **Active AI Provider:**
+        - {get_active_provider_name()}
+
+        **Provider Source:**
+        - `AI_PROVIDER` from `.env`
+
         **File Requirements:**
-        - Max file size: 10MB      
-      
-        
+        - Max file size: 10MB
+
         **Extracted Information:**
         - Company Name
         - Name
@@ -1044,14 +948,7 @@ def render_export_tab():
 
 def render_export_options():
     """Render export options and preview"""
-    # Count successful results with actual data
-    successful_with_data = []
-    for r in st.session_state.extracted_data:
-        if r['status'] == 'success' and 'data' in r:
-            data = r['data']
-            non_empty_fields = [v for v in data.values() if v and str(v).strip()]
-            if non_empty_fields:
-                successful_with_data.append(r)
+    successful_with_data = get_successful_results(st.session_state.extracted_data)
     
     if successful_with_data:
         total_results = len(st.session_state.extracted_data)
@@ -1253,32 +1150,6 @@ def main():
 </style>
 ''', unsafe_allow_html=True)
     initialize_session_state()
-    
-    # Show credentials modal only if explicitly requested
-    if st.session_state.get('show_credentials_modal', False):
-        show_credentials_modal()
-
-    # WatsonX credentials input in sidebar
-    st.sidebar.markdown("### 🛡️ WatsonX Credentials")
-    
-    # Pre-populate with session state values
-    current_api_key = st.session_state.get('watsonx_api_key', '')
-    current_project_id = st.session_state.get('watsonx_project_id', '')
-    current_url = st.session_state.get('watsonx_url', 'https://us-south.ml.cloud.ibm.com')
-    
-    watsonx_api_key = st.sidebar.text_input("WATSONX_API_KEY", value=current_api_key, type="password")
-    watsonx_project_id = st.sidebar.text_input("WATSONX_PROJECT_ID", value=current_project_id)
-    watsonx_url = st.sidebar.text_input("WATSONX_URL", value=current_url)
-    
-    # Add button to reconfigure credentials
-    if st.sidebar.button("🔄 Reconfigure Credentials"):
-        st.session_state.show_credentials_modal = True
-        st.rerun()
-
-    # Store credentials in session state for backend use
-    st.session_state['watsonx_api_key'] = watsonx_api_key
-    st.session_state['watsonx_project_id'] = watsonx_project_id
-    st.session_state['watsonx_url'] = watsonx_url
 
     # Add responsive logo and header CSS
     st.markdown("""
@@ -1318,9 +1189,10 @@ def main():
     col_logo, col_title = st.columns([0.5, 9.5])
     with col_title:
         st.markdown('<h1 class="responsive-header">Business Card Automation System</h1>', unsafe_allow_html=True)
-        st.markdown("""
+        st.markdown(f"""
         <div style='text-align: center; margin-bottom: 2rem; color: #6B7280;'>
-            Extract business card information using <strong>file uploads</strong> or <strong>camera capture</strong>
+            Extract business card information using <strong>file uploads</strong> or <strong>camera capture</strong><br/>
+            Active AI provider: <strong>{get_active_provider_name()}</strong>
         </div>
         """, unsafe_allow_html=True)
     

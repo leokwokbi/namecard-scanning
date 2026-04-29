@@ -1,5 +1,10 @@
 .env
 Copy of .env
 venv/
+.venv/
 __pycache__/
 Sample/
+namecard_results.csv
+namecard_results.json
+namecard_results.xlsx
+*.pyc
